@@ -1,0 +1,146 @@
+name: "Agentic QA"
+description: "Run qa-agent in customer CI with the pinned OpenCode runtime (FR-008, FR-015)"
+branding:
+  icon: "check-circle"
+  color: "blue"
+
+inputs:
+  command:
+    description: "qa-agent command: generate, run, detect, ingest, cases, explore, scripts, revise, classify, heal, assist-context"
+    required: true
+  mode:
+    description: "generate mode: setup, regenerate, scripts, revise"
+    required: false
+    default: "regenerate"
+  pr:
+    description: "PR number (required for revise)"
+    required: false
+    default: ""
+  api-url:
+    description: "Platform API base URL (defaults to QA_PLATFORM_URL env; the action default is the SaaS URL)"
+    required: false
+    default: ""
+  agent-version:
+    description: "npm version of @mahesh-bishnoi/qa-agent to install"
+    required: false
+    default: "latest"
+  opencode-version:
+    description: "Pinned OpenCode CLI version (Renovate bumps this with the Action SHA; R18)"
+    required: false
+    default: "1.18.33"
+  event-name:
+    description: "CI event name for the effective-settings guard (defaults to GITHUB_EVENT_NAME)"
+    required: false
+    default: ""
+
+outputs:
+  enabled:
+    description: "'true' when the trigger is enabled and the command ran, 'false' when the guard skipped it"
+    value: ${{ steps.guard.outputs.enabled }}
+  opencode_config:
+    description: "OpenCode config JSON for the qa-assist step (only set by assist-context)"
+    value: ${{ steps.agent.outputs.opencode_config }}
+  model_base_url:
+    description: "Model base URL for the qa-assist step (only set by assist-context)"
+    value: ${{ steps.agent.outputs.model_base_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Setup Node 24"
+      uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: "Install qa-agent"
+      shell: "bash"
+      run: |
+        npm install -g "@mahesh-bishnoi/qa-agent@${{ inputs.agent-version }}"
+        qa-agent --version
+
+    - name: "Install OpenCode CLI (pinned)"
+      shell: "bash"
+      env:
+        VERSION: ${{ inputs.opencode-version }}
+      run: |
+        if ! command -v opencode >/dev/null 2>&1; then
+          # The install script fetches latest unless VERSION is set (R18),
+          # so pinning here is what makes the Action SHA pin meaningful.
+          curl -fsSL https://opencode.ai/install | bash
+        fi
+        echo "${HOME}/.opencode/bin" >> "${GITHUB_PATH}"
+        opencode --version
+
+    - name: "Effective-settings guard"
+      id: guard
+      shell: "bash"
+      env:
+        QA_API_KEY: ${{ env.QA_API_KEY }}
+        QA_PLATFORM_URL: ${{ inputs.api-url != '' && inputs.api-url || env.QA_PLATFORM_URL }}
+        QA_COMMAND: ${{ inputs.command }}
+        QA_MODE: ${{ inputs.mode }}
+        QA_EVENT: ${{ inputs.event-name != '' && inputs.event-name || env.GITHUB_EVENT_NAME }}
+      run: |
+        # File wins key by key (FR-008): when the triggering event is disabled
+        # in the effective settings, exit 0 with a notice instead of running.
+        if [ -z "${QA_API_KEY}" ]; then
+          echo "::error::QA_API_KEY is not set (repo-scoped aq_live_... secret)."
+          exit 1
+        fi
+        if [ -z "${QA_PLATFORM_URL}" ]; then
+          echo "::error::Set api-url input or QA_PLATFORM_URL env to the platform base URL."
+          exit 1
+        fi
+        EFFECTIVE="$(curl -fsSL -H "Authorization: Bearer ${QA_API_KEY}" \
+          "${QA_PLATFORM_URL}/api/v1/settings/effective")" || {
+          echo "::error::Platform unreachable or 5xx (exit 10 equivalent); failing fast."
+          exit 1
+        }
+        EFFECTIVE="${EFFECTIVE}" QA_COMMAND="${QA_COMMAND}" QA_MODE="${QA_MODE}" QA_EVENT="${QA_EVENT}" node -e '
+          const effective = JSON.parse(process.env.EFFECTIVE ?? "{}");
+          const at = (path) => path.split(".").reduce((n, p) => (n && typeof n === "object" && p in n ? n[p] : undefined), effective);
+          const on = (path) => at(path)?.value !== false;
+          const cmd = process.env.QA_COMMAND, mode = process.env.QA_MODE || "regenerate", event = process.env.QA_EVENT || "";
+          let setting = null;
+          if (cmd === "assist-context") setting = "assist.onQaCommand";
+          else if (cmd === "run") {
+            setting = event === "workflow_dispatch" ? "run.onManual"
+              : event === "push" ? "run.onPushMain"
+              : event === "schedule" ? "run.nightly"
+              : event === "repository_dispatch" ? "run.postDeploy" : "run.onPullRequest";
+          } else if (cmd === "generate") {
+            setting = mode === "setup" ? "generate.onSetupMerge"
+              : mode === "scripts" ? "generate.onCaseApproval"
+              : mode === "revise" ? "generate.onScriptReviewComment" : "generate.onRegenerateLabel";
+          } else if (cmd === "revise") setting = "generate.onScriptReviewComment";
+          else if (cmd === "scripts") setting = "generate.onCaseApproval";
+          const enabled = setting === null ? true : on(setting);
+          const fs = require("node:fs");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `enabled=${enabled}\n`);
+          if (enabled) {
+            console.log(`Guard: ${setting ?? "(no guard)"} enabled; running ${cmd}.`);
+          } else {
+            const notice = `Notice: trigger disabled by effective settings (${setting}); skipping ${cmd}.`;
+            console.log(notice);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${notice}\n`);
+          }
+        '
+
+    - name: "Run qa-agent"
+      id: agent
+      if: steps.guard.outputs.enabled == 'true'
+      shell: "bash"
+      env:
+        QA_API_KEY: ${{ env.QA_API_KEY }}
+        QA_PLATFORM_URL: ${{ inputs.api-url != '' && inputs.api-url || env.QA_PLATFORM_URL }}
+        QA_LLM_ENDPOINT: ${{ env.QA_LLM_ENDPOINT }}
+        QA_LLM_API_KEY: ${{ env.QA_LLM_API_KEY }}
+      run: |
+        ARGS=("${{ inputs.command }}")
+        if [ "${{ inputs.command }}" = "generate" ]; then
+          ARGS+=(--mode "${{ inputs.mode }}")
+        fi
+        if [ -n "${{ inputs.pr }}" ]; then
+          ARGS+=(--pr "${{ inputs.pr }}")
+        fi
+        qa-agent "${ARGS[@]}"
