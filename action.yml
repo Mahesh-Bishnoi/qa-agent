@@ -69,6 +69,10 @@ runs:
           curl -fsSL https://opencode.ai/install | bash
         fi
         echo "${HOME}/.opencode/bin" >> "${GITHUB_PATH}"
+        # GITHUB_PATH takes effect only in the next step, so export PATH here
+        # for the `opencode --version` check in this same step (else exit 127
+        # on fresh runners where opencode was just installed).
+        export PATH="${HOME}/.opencode/bin:${PATH}"
         opencode --version
 
     - name: "Effective-settings guard"
